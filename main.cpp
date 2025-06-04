@@ -202,18 +202,17 @@ void send_packet(const string& iface,
     int payload_len = payload ? static_cast<int>(strlen(payload)) : 0;
     int packet_len = eth_len + ip_len + tcp_len + payload_len;
 
-    // (1) 헤더 복사본 생성
-    EthHdr new_eth;
-    IpHdr  new_ip;
-    TcpHdr new_tcp;
+    //hdr cpy
+    EthHdr copy_eth;
+    IpHdr  copy_ip;
+    TcpHdr copy_tcp;
 
-    // ── 이더넷 헤더 복사 및 수정 ──
-    memcpy(&new_eth, eth, eth_len);
+    
+    memcpy(&copy_eth, eth, eth_len);
     if (!is_forward) {
-        // 역방향(서버→클라이언트)이면 목적지 MAC을 원래 출발지 MAC으로 바꿈
-        new_eth.dmac_ = eth->smac_;
+        //backward -> src=my mac
+        copy_eth.dmac_ = eth->smac_;
     }
-    // 인터페이스의 MAC 주소를 직접 가져와서 source MAC으로 설정
     Mac our_mac;
     {
         int fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -227,21 +226,20 @@ void send_packet(const string& iface,
             close(fd);
         }
     }
-    new_eth.smac_ = our_mac;
+    copy_eth.smac_ = our_mac;
 
 
-    // ── IP 헤더 복사 및 수정 ──
-    memcpy(&new_ip, ip, ip_len);
+    memcpy(&copy_ip, ip, ip_len);
     if (!is_forward) {
-        // 서버→클라이언트 방향일 때: 출발지/목적지 IP 뒤바꾸고 TTL 초기화
-        new_ip.sip_ = ip->dip_;
-        new_ip.dip_ = ip->sip_;
-        new_ip.ttl  = 128;
+        // server->client, swap ip, TTL init
+        copy_ip.sip_ = ip->dip_;
+        copy_ip.dip_ = ip->sip_;
+        copy_ip.ttl  = 128;
     }
-    // 총길이 필드 재설정 (IP 헤더 + TCP 헤더 + payload)
-    new_ip.total_length = htons(static_cast<uint16_t>(ip_len + tcp_len + payload_len));
-    new_ip.checksum = 0;
-    // IP 체크섬 재계산 (간단한 방식)
+    // add payload
+    copy_ip.total_length = htons(static_cast<uint16_t>(ip_len + tcp_len + payload_len));
+    copy_ip.checksum = 0;
+    // IP chceksum
     auto ip_checksum = [](const IpHdr* iph)->uint16_t {
         const uint16_t* ptr = reinterpret_cast<const uint16_t*>(iph);
         int sum = 0;
@@ -251,36 +249,36 @@ void send_packet(const string& iface,
         }
         return htons(static_cast<uint16_t>(~sum & 0xFFFF));
     };
-    new_ip.checksum = ip_checksum(&new_ip);
+    copy_ip.checksum = ip_checksum(&copy_ip);
 
 
-    // ── TCP 헤더 복사 및 수정 ──
-    memcpy(&new_tcp, tcp, tcp_len);
+    //tcp
+    memcpy(&copy_tcp, tcp, tcp_len);
     if (is_forward) {
-        // 클라이언트→서버 방향: RST+ACK, seq += recv_len
-        new_tcp.th_flags = static_cast<uint8_t>(TcpHdr::RST) 
+        //client -> server : RST+ACK, seq += recv_len
+        copy_tcp.th_flags = static_cast<uint8_t>(TcpHdr::RST) 
                          | static_cast<uint8_t>(TcpHdr::ACK);
-        new_tcp.th_seq   = htonl(ntohl(tcp->th_seq) + recv_len);
-        new_tcp.th_ack   = tcp->th_ack;
+        copy_tcp.th_seq   = htonl(ntohl(tcp->th_seq) + recv_len);
+        copy_tcp.th_ack   = tcp->th_ack;
     }
     else {
-        // 서버→클라이언트 방향: 출발지/목적지 포트 뒤바꾸기 + FIN+ACK
-        new_tcp.th_sport = tcp->th_dport;
-        new_tcp.th_dport = tcp->th_sport;
-        new_tcp.th_flags = static_cast<uint8_t>(TcpHdr::FIN) 
+        // server -> client port swap + FIN+ACK
+        copy_tcp.th_sport = tcp->th_dport;
+        copy_tcp.th_dport = tcp->th_sport;
+        copy_tcp.th_flags = static_cast<uint8_t>(TcpHdr::FIN) 
                          | static_cast<uint8_t>(TcpHdr::ACK);
-        new_tcp.th_seq   = tcp->th_ack;
-        new_tcp.th_ack   = htonl(ntohl(tcp->th_seq) + recv_len);
+        copy_tcp.th_seq   = tcp->th_ack;
+        copy_tcp.th_ack   = htonl(ntohl(tcp->th_seq) + recv_len);
     }
-    // 데이터 오프셋 설정 (20바이트 = 5 * 4)
-    new_tcp.th_off = static_cast<uint8_t>(tcp_len / 4);
-    new_tcp.th_x2  = 0;   // 예약 비트 4비트
+    // offset
+    copy_tcp.th_off = static_cast<uint8_t>(tcp_len / 4);
+    copy_tcp.th_x2  = 0;   //  used 4bit
     
-    new_tcp.th_win   = 0;
-    new_tcp.th_urp   = 0;
-    new_tcp.th_sum   = 0; // 이후에 체크섬을 계산할 예정
+    copy_tcp.th_win   = 0;
+    copy_tcp.th_urp   = 0;
+    copy_tcp.th_sum   = 0;
 
-    // ── TCP 체크섬 계산을 위한 Pseudo Header 구성 ──
+    // checksum을 위한 pseudo header 정의
     struct PseudoHdr {
         uint32_t src_addr;
         uint32_t dst_addr;
@@ -289,8 +287,8 @@ void send_packet(const string& iface,
         uint16_t tcp_len;
     } psh;
 
-    psh.src_addr = new_ip.sip_;
-    psh.dst_addr = new_ip.dip_;
+    psh.src_addr = copy_ip.sip_;
+    psh.dst_addr = copy_ip.dip_;
     psh.zero     = 0;
     psh.protocol = IpHdr::TCP;
     psh.tcp_len  = htons(static_cast<uint16_t>(tcp_len + payload_len));
@@ -298,11 +296,11 @@ void send_packet(const string& iface,
     int cksum_buf_len = sizeof(PseudoHdr) + tcp_len + payload_len;
     uint8_t* cksum_buf = static_cast<uint8_t*>(malloc(cksum_buf_len));
     memcpy(cksum_buf, &psh, sizeof(PseudoHdr));
-    memcpy(cksum_buf + sizeof(PseudoHdr), &new_tcp, tcp_len);
+    memcpy(cksum_buf + sizeof(PseudoHdr), &copy_tcp, tcp_len);
     if (payload_len > 0) {
         memcpy(cksum_buf + sizeof(PseudoHdr) + tcp_len, payload, payload_len);
     }
-    // TCP 체크섬 계산 함수
+    // TCP checksum
     auto tcp_checksum = [](const uint8_t* buf, int len)->uint16_t {
         int sum = 0;
         const uint16_t* ptr = reinterpret_cast<const uint16_t*>(buf);
@@ -311,41 +309,41 @@ void send_packet(const string& iface,
             if (sum > 0xFFFF) sum = (sum & 0xFFFF) + 1;
         }
         if (len & 1) {
-            // 남은 1바이트 처리
+            // 1byte
             sum += (buf[len - 1] << 8) & 0xFF00;
             if (sum > 0xFFFF) sum = (sum & 0xFFFF) + 1;
         }
         return htons(static_cast<uint16_t>(~sum & 0xFFFF));
     };
-    new_tcp.th_sum = tcp_checksum(cksum_buf, cksum_buf_len);
+    copy_tcp.th_sum = tcp_checksum(cksum_buf, cksum_buf_len);
     free(cksum_buf);
 
 
-    // ── 최종 패킷 버퍼 조립 ──
+    // final 
     uint8_t* packet = static_cast<uint8_t*>(malloc(packet_len));
-    memcpy(packet, &new_eth, eth_len);
-    memcpy(packet + eth_len, &new_ip, ip_len);
-    memcpy(packet + eth_len + ip_len, &new_tcp, tcp_len);
+    memcpy(packet, &copy_eth, eth_len);
+    memcpy(packet + eth_len, &copy_ip, ip_len);
+    memcpy(packet + eth_len + ip_len, &copy_tcp, tcp_len);
     if (payload_len > 0) {
         memcpy(packet + eth_len + ip_len + tcp_len, payload, payload_len);
     }
 
 
-    // ── 전송 ──
+    // send
     if (is_forward) {
-        // pcap을 사용하여 Ethernet 헤더 포함 전체 패킷 송출
+        // pcap
         if (pcap_sendpacket(handle,
                             reinterpret_cast<const u_char*>(packet),
                             packet_len) != 0)
         {
-            fprintf(stderr, "pcap_sendpacket 실패: %s\n", pcap_geterr(handle));
+            fprintf(stderr, "pcap_sendpacket fail :%s\n", pcap_geterr(handle));
         }
     }
     else {
-        // RAW 소켓을 열어 IP 헤더부터 보내기 (Ethernet 헤더는 제외)
+        // socket
         int sockfd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
         if (sockfd < 0) {
-            fprintf(stderr, "RAW socket 생성 실패: %s\n", strerror(errno));
+            fprintf(stderr, "RAW socket create fail: %s\n", strerror(errno));
             free(packet);
             return;
         }
@@ -354,8 +352,8 @@ void send_packet(const string& iface,
 
         struct sockaddr_in dst{};
         dst.sin_family      = AF_INET;
-        dst.sin_port        = new_tcp.th_sport;    // RAW에서는 큰 의미 없음
-        dst.sin_addr.s_addr = new_ip.dip_;
+        dst.sin_port        = copy_tcp.th_sport;   
+        dst.sin_addr.s_addr = copy_ip.dip_;
 
         if (sendto(sockfd,
                    packet + eth_len,
@@ -364,7 +362,7 @@ void send_packet(const string& iface,
                    reinterpret_cast<struct sockaddr*>(&dst),
                    sizeof(dst)) < 0)
         {
-            perror("sendto 실패");
+            perror("sendto fail");
         }
         close(sockfd);
     }
